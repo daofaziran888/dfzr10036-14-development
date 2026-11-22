@@ -1,8 +1,13 @@
-"""水位管理服务：水位推进后触发checkpoint保存和lag_monitor延迟计算。"""
+"""水位管理服务：水位推进后触发checkpoint保存和lag_monitor延迟计算。
+
+提交位点优先取迟到事件分段推导出的可确认区间：存在待复核分段时水位不会
+越过它，避免把未复核的迟到记录当成已提交。
+"""
 from __future__ import annotations
 
 from typing import Any
 
+from app.services import late_window
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -17,6 +22,41 @@ class WatermarkMgrService(BaseModuleService):
     ACTION_RULES = {"提交水位": "已追上", "标记延迟": "水位延迟", "标记停滞": "已停滞"}
     NEGATIVE_ACTIONS = []
 
+    def sync_commit_from_segments(self, entry_id: int) -> dict[str, Any] | None:
+        """按迟到事件分段数据刷新实际可确认的提交位置。
+
+        数据流链路: late_event_segment -> watermark_mgr
+        """
+        entry = self.get_entry(entry_id)
+        if entry is None:
+            return None
+        stream = str(entry.get("数据流", ""))
+        commit = late_window.compute_commit(stream)
+        if not commit.get("ok"):
+            return {"ok": False, "message": commit.get("message", "没有可用分段"), "watermark": entry}
+        actual = commit.get("actual_commit_position")
+        previous = str(entry.get("提交位点", ""))
+        if actual is not None:
+            if previous != str(actual):
+                entry["上一位点"] = previous
+            entry["当前位点"] = str(actual)
+            entry["提交位点"] = str(actual)
+        entry["确认区间"] = commit.get("确认区间", "")
+        entry["位点口径"] = "迟到事件分段"
+        entry["阻塞分段"] = commit.get("阻塞分段", "")
+        if commit.get("状态") == "待复核阻塞":
+            entry["status"] = "推进中"
+            entry["abnormal"] = True
+        elif commit.get("状态") == "窗口可提交":
+            entry["status"] = "已追上"
+            entry["追赶进度"] = "100%"
+            entry["abnormal"] = False
+        else:
+            entry["status"] = "推进中"
+            entry["abnormal"] = False
+        entry["pending"] = entry["status"] != "已追上"
+        return {"ok": True, "watermark": entry, "commit": commit}
+
     def trigger_checkpoint(self, entry_id: int) -> dict[str, Any] | None:
         """水位提交后，保存checkpoint供断点恢复。
 
@@ -28,9 +68,13 @@ class WatermarkMgrService(BaseModuleService):
 
         cp_rows = store.rows("checkpoint")
         tag = str(entry.get("数据流", ""))
+        # 保存位点以分段推导的提交位点为准，而不是页面上的展示字段。
+        commit = late_window.compute_commit(tag)
+        actual = commit.get("actual_commit_position")
+        saved = str(actual) if actual is not None else str(entry.get("提交位点", ""))
         existing = [r for r in cp_rows if str(r.get("数据流", "")) == tag]
         if existing:
-            existing[0]["保存位点"] = str(entry.get("提交位点", ""))
+            existing[0]["保存位点"] = saved
             existing[0]["保存时间"] = "2026-11-18 10:35:00"
             existing[0]["status"] = "已保存"
             existing[0]["pending"] = True
@@ -42,7 +86,7 @@ class WatermarkMgrService(BaseModuleService):
             "id": new_id,
             "检查点编号": f"CHEC-{new_id:04d}",
             "数据流": tag,
-            "保存位点": str(entry.get("提交位点", "")),
+            "保存位点": saved,
             "保存时间": "2026-11-18 10:35:00",
             "恢复状态": "就绪",
             "丢失行数": 0,
